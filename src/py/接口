@@ -1,0 +1,216 @@
+# ========== 任务1：仅进行JSON化 ==========
+def process_json_task(task_id, file_name, chunks):
+    """生成JSON并保存，不进行向量化"""
+    try:
+        print(f"开始JSON化处理：{file_name}")
+        task_progress[task_id] = "开始生成 JSON 块"
+
+        # 调用LLM生成原始JSON块
+        llm_json = llm_json_process(file_name, chunks, task_id)
+        task_progress[task_id] = "生成 JSON 块完成"
+
+        task_progress[task_id] = "处理 JSON 文档块"
+        rest = json_process_list(llm_json, ["topic_index", "topic_type"])
+        json_file_path = f"./{ORIGIN_FILE}/{file_name}.json"
+        write_json(json_file_path, rest)
+        task_progress[task_id] = "处理 JSON 文档块完成"
+
+        # 更新文件状态：jsonCompleted=True, vectorized=False
+        update_file_status(task_id, file_name, vectorized=False, jsonCompleted=True)
+
+        # 可选：将生成的JSON内容暂存到全局字典，便于前端获取
+        # task_json_data[task_id] = rest  # 新增全局字典 task_json_data
+
+        task_progress[task_id] = "JSON化完成，等待用户校验"
+
+    except Exception as e:
+        print(e)
+        task_progress[task_id] = f"JSON化失败: {str(e)}"
+
+
+# ========== 任务2：仅进行向量化（依赖已完成的JSON） ==========
+def process_vectorize_task(task_id, file_name):
+    """执行向量化，前提是该文件的JSON已完成"""
+    try:
+        # 检查JSON是否已存在
+        json_file_path = f"./{ORIGIN_FILE}/{file_name}.json"
+        if not os.path.exists(json_file_path):
+            task_progress[task_id] = "向量化失败：JSON文件不存在，请先完成JSON化"
+            return
+
+        task_progress[task_id] = "开始向量化"
+        init(f"{file_name}")   # 假设init函数内部会读取JSON并向量化
+        task_progress[task_id] = "向量化完成"
+
+        update_file_status(task_id, file_name, vectorized=True, jsonCompleted=True)
+
+    except Exception as e:
+        print(e)
+        task_progress[task_id] = f"向量化失败: {str(e)}"
+
+
+@app.post("/data/upload")
+async def upload_file(file: UploadFile, metadata: str = Form(...)):
+    meta = json.loads(metadata)
+    task_id = str(meta["id"])
+    file_name = file.filename
+
+    # 保存文件
+    content = await file.read()
+    with open(f"./{ORIGIN_FILE}/{file_name}", "wb") as f:
+        f.write(content)
+
+    # 解析文档并计算 chunk 数
+    texts = load_document(f"./{ORIGIN_FILE}/{file_name}")
+    chunks = json_text_splitter.split_documents(texts)
+    meta["chunkCount"] = len(chunks)
+
+    # 写入文件列表（初始状态）
+    meta["name"] = file_name
+    meta["id"] = task_id
+    meta["vectorized"] = False
+    meta["jsonCompleted"] = False
+    meta["progress"] = ""
+    insrt_write_json(FILE_LIST, meta)
+
+    # 仅启动JSON化后台任务
+    asyncio.create_task(
+        run_in_thread_pool(process_json_task, task_id, file_name, chunks)
+    )
+
+    return {
+        "code": 200,
+        "msg": "上传成功，正在JSON化处理",
+        "data": {"task_id": task_id}
+    }
+
+
+@app.get("/data/json/{task_id}")
+def get_json_data(task_id: str):
+    """返回已生成的JSON数据（用于前端校验）"""
+    with file_list_lock:
+        files = load_json(FILE_LIST)
+        target_file = None
+        for f in files:
+            if str(f.get("id")) == task_id:
+                target_file = f
+                break
+
+    if not target_file:
+        return {"code": 404, "msg": "任务不存在"}
+
+    file_name = target_file.get("name")
+    if not file_name:
+        return {"code": 404, "msg": "文件名缺失"}
+
+    json_path = f"./{ORIGIN_FILE}/{file_name}.json"
+    if not os.path.exists(json_path):
+        return {"code": 404, "msg": "JSON文件尚未生成或不存在"}
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+        return {"code": 200, "data": json_data}
+    except Exception as e:
+        return {"code": 500, "msg": f"读取JSON失败: {str(e)}"}
+
+
+@app.post("/data/vectorize/{task_id}")
+def start_vectorize(task_id: str):
+    """用户确认JSON无误后，手动触发向量化"""
+    with file_list_lock:
+        files = load_json(FILE_LIST)
+        target_file = None
+        for f in files:
+            if str(f.get("id")) == task_id:
+                target_file = f
+                break
+
+    if not target_file:
+        return {"code": 404, "msg": "任务不存在"}
+
+    if not target_file.get("jsonCompleted", False):
+        return {"code": 400, "msg": "JSON尚未完成，请等待JSON化结束"}
+
+    if target_file.get("vectorized", False):
+        return {"code": 400, "msg": "已经完成向量化，无需重复操作"}
+
+    file_name = target_file["name"]
+    # 异步执行向量化任务
+    asyncio.create_task(
+        run_in_thread_pool(process_vectorize_task, task_id, file_name)
+    )
+
+    return {
+        "code": 200,
+        "msg": "已启动向量化任务，请轮询进度",
+        "data": {"task_id": task_id}
+    }
+
+# 轮询接口
+@app.get("/task/progress/{task_id}")
+def get_progress(task_id: str):
+    progress_text = task_progress.get(task_id, "未开始")
+
+    file_status = None
+    with file_list_lock:
+        files = load_json(FILE_LIST)
+        for file in files:
+            if str(file.get("id")) == task_id:
+                file_status = {
+                    "vectorized": file.get("vectorized", False),
+                    "jsonCompleted": file.get("jsonCompleted", False),
+                    "name": file.get("name", "")
+                }
+                break
+
+    if file_status is None:
+        file_status = {"vectorized": False, "jsonCompleted": False, "name": ""}
+
+    return {
+        "task_id": task_id,
+        "progress": progress_text,
+        "file_status": file_status
+    }
+
+
+
+# ========== 核心修改：按 task_id 更新文件状态 ==========
+def update_file_status(task_id, file_name, vectorized=False, jsonCompleted=False):
+    """
+    统一用 task_id（即文件记录中的 id 字段）查找并更新状态。
+    同时把 file_name 传入，以便在记录中补全 name（若缺失）。
+    """
+    with file_list_lock:
+        files = load_json(FILE_LIST)
+
+        for file in files:
+            if str(file.get("id")) == str(task_id):
+                # 确保有 name 字段（防止上传时未写入）
+                file["name"] = file.get("name", file_name) or file_name
+                # 更新状态
+                file["vectorized"] = vectorized
+                file["jsonCompleted"] = jsonCompleted
+                if vectorized and jsonCompleted:
+                    file["progress"] = "完成"
+                else:
+                    file["progress"] = file.get("progress", "")
+                break
+        else:
+            # 若没找到对应 task_id，则新建一条记录（防御性处理）
+            files.append({
+                "id": task_id,
+                "name": file_name,
+                "vectorized": vectorized,
+                "jsonCompleted": jsonCompleted,
+                "progress": "完成" if (vectorized and jsonCompleted) else ""
+            })
+
+        write_json(FILE_LIST, files)
+
+
+
+# ========== 线程池辅助 ==========
+async def run_in_thread_pool(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(thread_pool, func, *args)
