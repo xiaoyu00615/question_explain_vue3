@@ -490,8 +490,8 @@ onUnmounted(() => {
                                     </div>
                                 </div>
 
-                                <!-- 主题干 -->
-                                <div class="field-section">
+                                <!-- 主题干（仅综合应用题显示） -->
+                                <div v-if="currentQuestion.topic_type === '综合应用题'" class="field-section">
                                     <label class="field-label">主题干:</label>
                                     <div 
                                         class="field-value main-topic-text"
