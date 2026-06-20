@@ -45,6 +45,11 @@ const currentQuestion = computed(() => {
 })
 
 const hasChoices = computed(() => {
+    const type = currentQuestion.value?.topic_type || ''
+    // 简答题和填空题不显示选项
+    if (type.includes('简答') || type.includes('填空')) {
+        return false
+    }
     return currentQuestion.value?.choose && Object.keys(currentQuestion.value.choose).length > 0
 })
 
@@ -131,6 +136,8 @@ function saveEdit() {
         }
     } else if (field === 'explain') {
         question.explain = editValue.value
+    } else if (field === 'main_topic') {
+        question.main_topic = editValue.value
     } else if (field === 'choose' && key) {
         if (!question.choose) question.choose = {}
         question.choose[key] = editValue.value
